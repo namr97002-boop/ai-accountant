@@ -105,9 +105,10 @@ let accessToken = null;
 
 function initGoogleLogin() {
     tokenClient = google.accounts.oauth2.initTokenClient({
-        client_id: CLIENT_ID,
-        scope: 'profile email',
-        callback: (tokenResponse) => {
+    client_id: CLIENT_ID,
+    scope: 'https://www.googleapis.com/auth/drive.file profile email',   // <--- هذا هو الصحيح
+    callback: (tokenResponse) => { ... }
+});
             accessToken = tokenResponse.access_token;
             localStorage.setItem('google_access_token', accessToken);
             localStorage.setItem('user_logged_in', 'true');
@@ -171,31 +172,73 @@ setTimeout(checkGoogleSession, 500);
 // رفع الملف إلى درايف التاجر
 async function uploadToDrive(filename, content) {
     if (!accessToken) {
-        requestDrivePermission();
+        showToast('⚠️ الرجاء تسجيل الدخول أولاً', 'error');
         return;
     }
     
-    const metadata = {
-        name: filename,
-        mimeType: 'application/json',
-        parents: ['root']
-    };
-    
-    const form = new FormData();
-    form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
-    form.append('file', new Blob([content], { type: 'application/json' }));
-    
-    const response = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
-        method: 'POST',
-        headers: new Headers({ 'Authorization': 'Bearer ' + accessToken }),
-        body: form
-    });
-    
-    const data = await response.json();
-    if (data.id) {
-        alert(`✅ تم حفظ الأرشيف في درايفك\n🔗 ${data.webViewLink}`);
-    } else {
-        alert("❌ فشل الرفع، حاول مرة أخرى");
+    try {
+        // 1️⃣ البحث عن ملف بنفس الاسم في Drive
+        const searchResponse = await fetch(
+            `https://www.googleapis.com/drive/v3/files?q=name='${filename}' and trashed=false`,
+            {
+                headers: { 'Authorization': 'Bearer ' + accessToken }
+            }
+        );
+        const searchResult = await searchResponse.json();
+        const existingFile = searchResult.files?.[0];
+        
+        if (existingFile) {
+            // 2️⃣ الملف موجود → نحدثه (يحل محل القديم)
+            const updateResponse = await fetch(
+                `https://www.googleapis.com/upload/drive/v3/files/${existingFile.id}?uploadType=media`,
+                {
+                    method: 'PATCH',
+                    headers: {
+                        'Authorization': 'Bearer ' + accessToken,
+                        'Content-Type': 'application/json'
+                    },
+                    body: content
+                }
+            );
+            
+            if (updateResponse.ok) {
+                showToast('✅ تم تحديث الملف بنجاح في درايفك', 'success');
+            } else {
+                showToast('❌ فشل تحديث الملف', 'error');
+            }
+            
+        } else {
+            // 3️⃣ الملف غير موجود → ننشئ ملف جديد
+            const metadata = {
+                name: filename,
+                mimeType: 'application/json',
+                parents: ['root']
+            };
+            
+            const form = new FormData();
+            form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+            form.append('file', new Blob([content], { type: 'application/json' }));
+            
+            const response = await fetch(
+                'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
+                {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + accessToken },
+                    body: form
+                }
+            );
+            
+            const data = await response.json();
+            if (data.id) {
+                showToast(`✅ تم رفع الملف بنجاح في درايفك`, 'success');
+            } else {
+                showToast("❌ فشل الرفع، حاول مرة أخرى", 'error');
+            }
+        }
+        
+    } catch (e) {
+        console.error('خطأ:', e);
+        showToast('❌ خطأ: ' + e.message, 'error');
     }
 }
 
@@ -204,15 +247,56 @@ async function archiveYearToDrive() {
     const year = prompt("📅 أدخل السنة المراد أرشفتها:");
     if (!year) return;
     
+    const filename = `سنة_${year}.json`; // اسم ثابت لكل سنة
+    
     const allInvoices = await invoicesStore.getAll();
+    const allPayments = await paymentsStore.getAll();
+    const allItems = await invoiceItemsStore.getAll();
+    
+    const startDate = new Date(year, 0, 1);
+    const endDate = new Date(year, 11, 31, 23, 59, 59);
+    
+    const yearInvoices = allInvoices.filter(inv => {
+        const d = new Date(inv.created_at);
+        return d >= startDate && d <= endDate;
+    });
+    
+    const yearPayments = allPayments.filter(p => {
+        const d = new Date(p.created_at);
+        return d >= startDate && d <= endDate;
+    });
+    
+    if (yearInvoices.length === 0 && yearPayments.length === 0) {
+        showToast(`📭 لا توجد بيانات في سنة ${year}`, "warning");
+        return;
+    }
+    
     const archiveData = {
-        year: year,
-        date: new Date().toISOString(),
-        invoices: allInvoices.filter(inv => new Date(inv.created_at).getFullYear() == year)
+        year: parseInt(year),
+        export_date: new Date().toISOString(),
+        invoices: yearInvoices,
+        payments: yearPayments,
+        invoice_items: allItems.filter(item => yearInvoices.some(inv => inv.id === item.invoice_id))
     };
     
-    const content = JSON.stringify(archiveData, null, 2);
-    await uploadToDrive(`سنة_${year}.json`, content);
+    if (!confirm(`📅 السنة: ${year}\n📄 الفواتير: ${yearInvoices.length}\n💰 السندات: ${yearPayments.length}\n\nسيتم رفعها إلى Drive (ستحل محل النسخة القديمة إن وجدت). هل تريد المتابعة؟`)) return;
+    
+    showToast("☁️ جاري الرفع إلى Drive...", "info");
+    
+    try {
+        const content = JSON.stringify(archiveData, null, 2);
+        await uploadToDrive(filename, content);
+        
+        // حذف البيانات من التطبيق بعد الأرشفة
+        for (const inv of yearInvoices) await invoicesStore.delete(inv.id);
+        for (const p of yearPayments) await paymentsStore.delete(p.id);
+        
+        localStorage.setItem(`archived_${year}`, new Date().toISOString());
+        showToast(`✅ تم أرشفة سنة ${year} بنجاح`, "success");
+        if (typeof loadData === 'function') loadData();
+    } catch(e) {
+        showToast("❌ فشل الأرشفة: " + e.message, "error");
+    }
 }
 
 // استعادة الصلاحية لو تخزنت
@@ -3813,10 +3897,7 @@ if (activeMode === 'credit' && sendSMS && selectedContactPhone) {
         } catch (e) { showToast('خطأ: ' + e.message, 'error'); }
         setLoading(false);
     }
-// ==================== دوال النسخ الاحتياطي المصححة والكاملة ====================
-
-// 1. تعريف الرابط (تأكد أنه لا يتكرر في مكان آخر في ملفك)
-const CLOUD_API_URL = 'https://script.google.com/macros/s/AKfycbxsG_fdB_Qx71tV2Hh3GZ1iUtFwQqtRuMMP8564GD74mcbDXiUZEbGpgrmOXzTjc_VK/exec';
+// ==================== دوال النسخ الاحتياطي (Drive API مباشرة) ====================
 
 // دالة مساعدة لجلب كافة البيانات من التخزين المحلي
 async function getAllProjectData() {
@@ -3845,7 +3926,7 @@ async function getAllProjectData() {
     };
 }
 
-// 2. تصدير نسخة احتياطية محلية (ملف JSON)
+// ========== 1. تصدير نسخة احتياطية محلية ==========
 async function exportBackup() {
     setLoading(true);
     try {
@@ -3866,27 +3947,27 @@ async function exportBackup() {
     }
 }
 
-// 3. رفع نسخة إلى Drive (معدلة لتعمل مع السكربت المتطور)
+// ========== 2. رفع نسخة إلى Drive مباشرة ==========
 async function backupToDrive() {
     if (!navigator.onLine) {
         showToast('⚠️ لا يوجد اتصال بالإنترنت', 'error');
         return;
     }
+    
+    if (!localStorage.getItem('user_logged_in')) {
+        showToast('⚠️ الرجاء تسجيل الدخول أولاً', 'error');
+        return;
+    }
+    
     setLoading(true);
     try {
         showToast('📦 جاري تجهيز البيانات للرفع...', 'info');
         const backup = await getAllProjectData();
-
-        // استخدام POST لإرسال الأكشن والبيانات
-        await fetch(CLOUD_API_URL, {
-            method: 'POST',
-            mode: 'no-cors', // لضمان تجاوز قيود CORS أثناء الرفع
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action: 'upload', backup: backup })
-        });
-
-        // في وضع no-cors نفترض النجاح إذا لم يحدث خطأ في الاتصال
-        showToast('✅ تم إرسال النسخة إلى Drive بنجاح', 'success');
+        const content = JSON.stringify(backup, null, 2);
+        const filename = `backup_${new Date().toISOString().split('T')[0]}.json`;
+        
+        await uploadToDrive(filename, content);
+        
     } catch(e) {
         console.error("خطأ الرفع:", e);
         showToast("❌ فشل الرفع: " + e.message, "error");
@@ -3895,50 +3976,7 @@ async function backupToDrive() {
     }
 }
 
-// 4. استعادة من Drive (معدلة جذرياً لحل مشكلة "لا توجد نسخة")
-async function restoreFromCloud() {
-    if (!navigator.onLine) {
-        showToast('⚠️ لا يوجد اتصال بالإنترنت', 'error');
-        return;
-    }
-    if (!confirm('⚠️ تحذير: سيتم حذف البيانات الحالية واستبدالها بنسخة Drive؟')) return;
-
-    setLoading(true);
-    try {
-        showToast('☁️ جاري طلب البيانات من Drive...', 'info');
-        
-        // إرسال طلب POST لأن السكربت يعالج الأكشن في doPost
-        const response = await fetch(CLOUD_API_URL, {
-            method: 'POST',
-            redirect: 'follow',
-            body: JSON.stringify({ action: 'restore' })
-        });
-
-        const text = await response.text();
-        
-        // فحص إذا كان الرد HTML (صفحة خطأ من جوجل) لمنع خطأ الـ Token
-        if (text.trim().startsWith('<')) {
-            throw new Error("رد غير صالح من الخادم. تأكد من إعدادات النشر على (Anyone).");
-        }
-
-        const result = JSON.parse(text);
-
-        if (result.status === 'success' && result.data) {
-            await applyBackupData(result.data);
-            showToast(`✅ تم استعادة البيانات بنجاح`, 'success');
-            setTimeout(() => location.reload(), 1000);
-        } else {
-            showToast('⚠️ ' + (result.message || 'لم يتم العثور على نسخة'), 'error');
-        }
-    } catch(e) {
-        console.error('خطأ الاستعادة:', e);
-        showToast('❌ فشل الاستعادة: تأكد من وجود ملف النسخة في درايف', 'error');
-    } finally {
-        setLoading(false);
-    }
-}
-
-// 5. استعادة من ملف محلي
+// ========== 3. استعادة من ملف محلي ==========
 async function importBackup() {
     const input = document.createElement('input');
     input.type = 'file';
@@ -3962,6 +4000,34 @@ async function importBackup() {
     };
     input.click();
 }
+
+// ========== 4. دالة تطبيق البيانات المستعادة ==========
+async function applyBackupData(data) {
+    const storeMap = [
+        { store: productsStore, items: data.products },
+        { store: contactsStore, items: data.contacts },
+        { store: invoicesStore, items: data.invoices },
+        { store: invoiceItemsStore, items: data.invoice_items },
+        { store: paymentsStore, items: data.payments }
+    ];
+
+    for (const entry of storeMap) {
+        if (entry.items) {
+            await entry.store.clear();
+            for (const item of entry.items) {
+                await entry.store.setItem(item.id, item);
+            }
+        }
+    }
+    if (typeof loadMasterDataFromCache === "function") await loadMasterDataFromCache();
+}
+
+// ربط الدوال بالمتصفح
+window.exportBackup = exportBackup;
+window.backupToDrive = backupToDrive;
+window.importBackup = importBackup;
+
+console.log('✅ تم تفعيل دوال النسخ الاحتياطي (Drive API مباشرة)');
 
 // دالة مساعدة لتطبيق البيانات على المخازن
 async function applyBackupData(data) {
@@ -10400,6 +10466,158 @@ window.addToGrid = function() {
         watchModals();
     }, 1500);
 
+})();
+// ==================== النسخ الاحتياطي التلقائي الصامت (بدون ضغط) ====================
+(function() {
+    'use strict';
+    
+    // ====== الإعدادات ======
+    const BACKUP_INTERVAL_MS = 12 * 60 * 60 * 1000; // 12 ساعة
+    const LAST_BACKUP_KEY = 'silent_auto_backup_time';
+    const BACKUP_FILENAME = 'backup_auto_latest.json'; // اسم ثابت يحل محل القديم
+    
+    let isBackupRunning = false;
+    
+    // ====== دالة النسخ الصامت ======
+    async function performSilentBackup() {
+        // منع التشغيل المتزامن
+        if (isBackupRunning) return;
+        isBackupRunning = true;
+        
+        try {
+            // التحقق من وجود إنترنت
+            if (!navigator.onLine) {
+                console.log('📡 [AutoBackup] لا يوجد إنترنت - تأجيل');
+                isBackupRunning = false;
+                return;
+            }
+            
+            // التحقق من تسجيل الدخول
+            if (!localStorage.getItem('user_logged_in')) {
+                console.log('👤 [AutoBackup] المستخدم غير مسجل دخول');
+                isBackupRunning = false;
+                return;
+            }
+            
+            console.log('🔄 [AutoBackup] جاري إنشاء نسخة تلقائية...');
+            
+            // جلب جميع البيانات
+            const backup = await getAllProjectData();
+            
+            // إضافة معلومات النسخة التلقائية
+            backup.auto_backup = {
+                timestamp: new Date().toISOString(),
+                type: 'automatic',
+                version: '2.0'
+            };
+            
+            const content = JSON.stringify(backup, null, 2);
+            
+            // حفظ في OPFS محلياً (نسخة احتياطية محلية)
+            try {
+                localStorage.setItem('last_auto_backup_data', content);
+                localStorage.setItem('last_auto_backup_time', Date.now().toString());
+            } catch (e) {
+                // تجاهل أخطاء التخزين المحلي
+            }
+            
+            // رفع إلى Drive إذا كان هناك accessToken
+            if (accessToken) {
+                await uploadToDrive(BACKUP_FILENAME, content);
+                console.log('✅ [AutoBackup] تم رفع النسخة إلى Drive');
+            } else {
+                console.log('💾 [AutoBackup] حفظ محلي فقط (لا يوجد accessToken)');
+            }
+            
+            // تحديث وقت آخر نسخة
+            localStorage.setItem(LAST_BACKUP_KEY, Date.now().toString());
+            
+            console.log('✅ [AutoBackup] تم إنشاء النسخة التلقائية بنجاح');
+            
+        } catch (e) {
+            console.error('❌ [AutoBackup] فشل:', e.message);
+        } finally {
+            isBackupRunning = false;
+        }
+    }
+    
+    // ====== دالة التحقق من الحاجة للنسخ ======
+    async function checkAndBackup() {
+        // منع الضغط على المستخدم - لا نعرض أي إشعارات
+        
+        const lastBackup = localStorage.getItem(LAST_BACKUP_KEY);
+        const now = Date.now();
+        
+        // إذا لم يسبق نسخ → ننشئ نسخة فورية
+        if (!lastBackup) {
+            console.log('🆕 [AutoBackup] أول نسخة تلقائية');
+            await performSilentBackup();
+            return;
+        }
+        
+        const timeSinceLastBackup = now - parseInt(lastBackup);
+        
+        // إذا مر 12 ساعة → ننشئ نسخة
+        if (timeSinceLastBackup >= BACKUP_INTERVAL_MS) {
+            const hours = Math.floor(timeSinceLastBackup / (1000 * 60 * 60));
+            console.log(`⏰ [AutoBackup] مر ${hours} ساعة - إنشاء نسخة جديدة`);
+            await performSilentBackup();
+        }
+    }
+    
+    // ====== التشغيل التلقائي ======
+    function initSilentAutoBackup() {
+        console.log('🔇 [AutoBackup] نظام النسخ التلقائي الصامت يعمل (كل 12 ساعة)');
+        
+        // فحص أولي بعد 1 دقيقة من تحميل الصفحة
+        setTimeout(async () => {
+            await checkAndBackup();
+        }, 60000);
+        
+        // التحقق كل 30 دقيقة
+        setInterval(async () => {
+            await checkAndBackup();
+        }, 30 * 60 * 1000); // 30 دقيقة
+        
+        // عند العودة إلى الإنترنت بعد انقطاع
+        window.addEventListener('online', async () => {
+            console.log('📶 [AutoBackup] تم استعادة الإنترنت - فحص النسخ');
+            await checkAndBackup();
+        });
+        
+        // عند تسجيل الدخول
+        document.addEventListener('user_logged_in', async () => {
+            console.log('👤 [AutoBackup] تم تسجيل الدخول - فحص النسخ');
+            setTimeout(async () => {
+                await checkAndBackup();
+            }, 10000);
+        });
+    }
+    
+    // ====== بدء التشغيل ======
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initSilentAutoBackup);
+    } else {
+        initSilentAutoBackup();
+    }
+    
+    // ====== دوال مساعدة للاختبار ======
+    window.forceSilentBackup = async function() {
+        console.log('🔧 [AutoBackup] نسخ فوري (للاختبار)');
+        await performSilentBackup();
+        if (typeof showToast === 'function') {
+            showToast('✅ تم إنشاء نسخة تلقائية', 'success');
+        }
+    };
+    
+    window.getAutoBackupStatus = function() {
+        const lastBackup = localStorage.getItem(LAST_BACKUP_KEY);
+        if (!lastBackup) return 'لم يتم إنشاء نسخة بعد';
+        const hours = Math.floor((Date.now() - parseInt(lastBackup)) / (1000 * 60 * 60));
+        return `آخر نسخة: ${hours} ساعة مضت`;
+    };
+    
+    console.log('✅ [AutoBackup] نظام النسخ التلقائي الصامت جاهز');
 })();
 </script>
 
