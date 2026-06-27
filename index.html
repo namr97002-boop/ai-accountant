@@ -105,25 +105,31 @@ let accessToken = null;
 
 function initGoogleLogin() {
     tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: CLIENT_ID,
-    scope: 'https://www.googleapis.com/auth/drive.file profile email',   // <--- هذا هو الصحيح
-    callback: (tokenResponse) => { ... }
-});
-            accessToken = tokenResponse.access_token;
-            localStorage.setItem('google_access_token', accessToken);
-            localStorage.setItem('user_logged_in', 'true');
-            
-            if (typeof showToast === 'function') {
-                showToast('✅ تم تسجيل الدخول بنجاح', 'success');
+        client_id: CLIENT_ID,
+        scope: 'https://www.googleapis.com/auth/drive.file profile email',
+        callback: (tokenResponse) => {
+            // ✅ كل الكود يجب أن يكون داخل الـ callback
+            if (tokenResponse.access_token) {
+                accessToken = tokenResponse.access_token;
+                localStorage.setItem('google_access_token', accessToken);
+                localStorage.setItem('user_logged_in', 'true');
+                
+                if (typeof showToast === 'function') {
+                    showToast('✅ تم تسجيل الدخول بنجاح', 'success');
+                } else {
+                    alert('✅ تم تسجيل الدخول بنجاح');
+                }
+                
+                document.getElementById('portal-screen').style.display = 'none';
+                document.getElementById('main-system').style.display = 'block';
+                
+                if (typeof initMainSystem === 'function') {
+                    initMainSystem();
+                }
             } else {
-                alert('✅ تم تسجيل الدخول بنجاح');
-            }
-            
-            document.getElementById('portal-screen').style.display = 'none';
-            document.getElementById('main-system').style.display = 'block';
-            
-            if (typeof initMainSystem === 'function') {
-                initMainSystem();
+                if (typeof showToast === 'function') {
+                    showToast('❌ فشل تسجيل الدخول: لم يتم استلام التوكن', 'error');
+                }
             }
         },
         error_callback: (error) => {
