@@ -95,45 +95,83 @@
 </style>
     
 <script>
-// ==================== رفع الأرشيف إلى درايف التاجر ====================
-// ==================== Google OAuth لتسجيل الدخول ====================
+// ==================== Google OAuth - الإصدار النهائي المتكامل ====================
 const CLIENT_ID = '157282257978-mqr9f2gqdbdmua4iqvb0edilrubt96hi.apps.googleusercontent.com';
-const REDIRECT_URI = 'https://ai-accountant-ori2.vercel.app/';
 
 let tokenClient = null;
 let accessToken = null;
+let refreshPromise = null;
+let systemInitialized = false;
+let loginRequested = false;
 
+// ========== 1. التحقق من تحميل مكتبة Google ==========
+function isGoogleLoaded() {
+    return !!(window.google?.accounts?.oauth2);
+}
+
+// ========== 2. دوال إدارة وقت الانتهاء في sessionStorage ==========
+function saveExpiry(expiry) {
+    try {
+        sessionStorage.setItem('google_token_expiry', String(expiry));
+    } catch (e) {
+        console.warn('⚠️ فشل حفظ وقت الانتهاء في sessionStorage:', e);
+    }
+}
+
+function loadExpiry() {
+    try {
+        return Number(sessionStorage.getItem('google_token_expiry')) || 0;
+    } catch (e) {
+        console.warn('⚠️ فشل قراءة وقت الانتهاء من sessionStorage:', e);
+        return 0;
+    }
+}
+
+function clearExpiry() {
+    try {
+        sessionStorage.removeItem('google_token_expiry');
+    } catch (e) {
+        console.warn('⚠️ فشل حذف وقت الانتهاء من sessionStorage:', e);
+    }
+}
+
+// ========== 3. تهيئة Google Token Client ==========
 function initGoogleLogin() {
+    if (tokenClient) return;
+    
+    if (!isGoogleLoaded()) {
+        console.error('❌ Google Identity Services لم تُحمّل بعد');
+        setTimeout(initGoogleLogin, 1000);
+        return;
+    }
+    
     tokenClient = google.accounts.oauth2.initTokenClient({
         client_id: CLIENT_ID,
         scope: 'https://www.googleapis.com/auth/drive.file profile email',
         callback: (tokenResponse) => {
-            // ✅ كل الكود يجب أن يكون داخل الـ callback
             if (tokenResponse.access_token) {
                 accessToken = tokenResponse.access_token;
-                localStorage.setItem('google_access_token', accessToken);
-                localStorage.setItem('user_logged_in', 'true');
+                const expiresIn = tokenResponse.expires_in || 3600;
+                const expiry = Date.now() + (expiresIn - 60) * 1000;
+                saveExpiry(expiry);
+                refreshPromise = null;
                 
                 if (typeof showToast === 'function') {
                     showToast('✅ تم تسجيل الدخول بنجاح', 'success');
-                } else {
-                    alert('✅ تم تسجيل الدخول بنجاح');
                 }
                 
-                document.getElementById('portal-screen').style.display = 'none';
-                document.getElementById('main-system').style.display = 'block';
-                
-                if (typeof initMainSystem === 'function') {
-                    initMainSystem();
-                }
-            } else {
+                startSystem();
+            } else if (tokenResponse.error) {
+                console.error('❌ خطأ في تسجيل الدخول:', tokenResponse.error);
+                refreshPromise = null;
                 if (typeof showToast === 'function') {
-                    showToast('❌ فشل تسجيل الدخول: لم يتم استلام التوكن', 'error');
+                    showToast('❌ فشل تسجيل الدخول: ' + tokenResponse.error, 'error');
                 }
             }
         },
         error_callback: (error) => {
-            console.error('خطأ في تسجيل الدخول:', error);
+            console.error('❌ خطأ في تسجيل الدخول:', error);
+            refreshPromise = null;
             if (typeof showToast === 'function') {
                 showToast('❌ فشل تسجيل الدخول: ' + error.message, 'error');
             }
@@ -141,119 +179,398 @@ function initGoogleLogin() {
     });
 }
 
+// ========== 4. دالة بدء النظام (مرة واحدة فقط) ==========
+function startSystem() {
+    if (systemInitialized) return;
+    systemInitialized = true;
+    
+    const portal = document.getElementById('portal-screen');
+    const main = document.getElementById('main-system');
+    
+    if (portal) portal.style.display = 'none';
+    if (main) main.style.display = 'block';
+    
+    if (typeof initMainSystem === 'function') {
+        initMainSystem();
+    }
+}
+
+// ========== 5. الحصول على توكن جديد بصمت ==========
+function getTokenSilently() {
+    return new Promise((resolve) => {
+        if (!tokenClient) {
+            initGoogleLogin();
+            setTimeout(() => {
+                if (!tokenClient) {
+                    requestLogin();
+                    resolve(false);
+                    return;
+                }
+                performSilentTokenRequest(resolve);
+            }, 300);
+        } else {
+            performSilentTokenRequest(resolve);
+        }
+    });
+}
+
+function performSilentTokenRequest(resolve) {
+    const originalCallback = tokenClient.callback;
+    
+    tokenClient.callback = (response) => {
+        tokenClient.callback = originalCallback;
+        
+        if (response.access_token) {
+            accessToken = response.access_token;
+            const expiresIn = response.expires_in || 3600;
+            const expiry = Date.now() + (expiresIn - 60) * 1000;
+            saveExpiry(expiry);
+            console.log('✅ تم استعادة التوكن بصمت');
+            resolve(true);
+        } else {
+            console.warn('⚠️ فشل استعادة التوكن بصمت:', response.error);
+            if (response.error === 'access_denied' || response.error === 'consent_required') {
+                requestLogin();
+            }
+            resolve(false);
+        }
+    };
+    
+    tokenClient.requestAccessToken({ prompt: '' });
+}
+
+// ========== 6. التحقق من صلاحية التوكن وتجديده ==========
+async function ensureValidToken() {
+    if (refreshPromise) {
+        await refreshPromise;
+        return !!accessToken;
+    }
+    
+    if (!accessToken) {
+        const expiry = loadExpiry();
+        const now = Date.now();
+        
+        if (expiry && now < expiry) {
+            console.log('⏳ استعادة التوكن من sessionStorage...');
+            const success = await getTokenSilently();
+            if (success) return true;
+        } else {
+            if (expiry) clearExpiry();
+            requestLogin();
+            return false;
+        }
+    }
+    
+    const expiry = loadExpiry();
+    const now = Date.now();
+    
+    if (now > expiry) {
+        console.log('⏳ التوكن منتهي، جاري التجديد...');
+        
+        if (!tokenClient) {
+            initGoogleLogin();
+            await new Promise(resolve => setTimeout(resolve, 500));
+            if (!tokenClient) {
+                requestLogin();
+                return false;
+            }
+        }
+        
+        refreshPromise = new Promise((resolve) => {
+            const originalCallback = tokenClient.callback;
+            
+            tokenClient.callback = (response) => {
+                tokenClient.callback = originalCallback;
+                
+                if (response.access_token) {
+                    accessToken = response.access_token;
+                    const expiresIn = response.expires_in || 3600;
+                    const expiry = Date.now() + (expiresIn - 60) * 1000;
+                    saveExpiry(expiry);
+                    
+                    console.log('✅ تم تجديد التوكن بنجاح');
+                    if (typeof showToast === 'function') {
+                        showToast('✅ تم تجديد الجلسة', 'success');
+                    }
+                    refreshPromise = null;
+                    resolve(true);
+                } else if (response.error) {
+                    console.error('❌ فشل تجديد التوكن:', response.error);
+                    refreshPromise = null;
+                    accessToken = null;
+                    clearExpiry();
+                    requestLogin();
+                    resolve(false);
+                }
+            };
+            
+            tokenClient.requestAccessToken({ prompt: '' });
+            
+            setTimeout(() => {
+                if (refreshPromise) {
+                    tokenClient.callback = originalCallback;
+                    refreshPromise = null;
+                    console.warn('⚠️ تجاوز وقت انتظار تجديد التوكن');
+                    requestLogin();
+                    resolve(false);
+                }
+            }, 5000);
+        });
+        
+        return await refreshPromise;
+    }
+    
+    return true;
+}
+
+// ========== 7. دالة طلب تسجيل الدخول (مرة واحدة) ==========
+function requestLogin() {
+    if (loginRequested) return;
+    loginRequested = true;
+    
+    setTimeout(() => {
+        loginRequested = false;
+        loginWithGoogle();
+    }, 100);
+}
+
+// ========== 8. دالة تسجيل الدخول ==========
 function loginWithGoogle() {
     if (!tokenClient) {
         initGoogleLogin();
         setTimeout(() => {
-            if (tokenClient) tokenClient.requestAccessToken();
+            if (tokenClient) {
+                const hasGrantedBefore = !!loadExpiry();
+                tokenClient.requestAccessToken({
+                    prompt: hasGrantedBefore ? '' : 'consent'
+                });
+            }
         }, 500);
     } else {
-        tokenClient.requestAccessToken();
+        const hasGrantedBefore = !!loadExpiry();
+        tokenClient.requestAccessToken({
+            prompt: hasGrantedBefore ? '' : 'consent'
+        });
     }
 }
 
-function checkGoogleSession() {
-    const loggedIn = localStorage.getItem('user_logged_in');
-    if (loggedIn === 'true') {
-        document.getElementById('portal-screen').style.display = 'none';
-        document.getElementById('main-system').style.display = 'block';
-        if (typeof initMainSystem === 'function') initMainSystem();
-        return true;
-    }
-    return false;
-}
-
+// ========== 9. دالة تسجيل الخروج ==========
 function logoutFromGoogle() {
-    localStorage.removeItem('user_logged_in');
-    localStorage.removeItem('google_access_token');
-    document.getElementById('main-system').style.display = 'none';
-    document.getElementById('portal-screen').style.display = 'block';
+    if (accessToken) {
+        try {
+            if (window.google?.accounts?.oauth2?.revoke) {
+                google.accounts.oauth2.revoke(accessToken);
+                console.log('✅ تم إلغاء التوكن');
+            }
+        } catch(e) {
+            console.warn('⚠️ فشل إلغاء التوكن:', e);
+        }
+    }
+    
+    accessToken = null;
+    refreshPromise = null;
+    systemInitialized = false;
+    clearExpiry();
+    
+    const portal = document.getElementById('portal-screen');
+    const main = document.getElementById('main-system');
+    
+    if (portal) portal.style.display = 'block';
+    if (main) main.style.display = 'none';
+    
     if (typeof showToast === 'function') {
         showToast('👋 تم تسجيل الخروج', 'success');
     }
 }
 
-setTimeout(checkGoogleSession, 500);
+// ========== 10. طبقة عامة لطلبات Google Drive ==========
+async function driveFetch(url, options = {}, timeoutMs = 15000) {
+    const valid = await ensureValidToken();
+    if (!valid) {
+        throw new Error('Authentication required');
+    }
+    
+    const headers = {
+        ...(options.headers || {}),
+        'Authorization': 'Bearer ' + accessToken
+    };
+    
+    try {
+        let response = await fetch(url, {
+            ...options,
+            headers: headers
+        });
+        
+        if (response.status === 401 || response.status === 403) {
+            console.log(`⚠️ خطأ ${response.status}، جاري تجديد المصادقة...`);
+            accessToken = null;
+            clearExpiry();
+            
+            const renewed = await ensureValidToken();
+            if (renewed) {
+                headers['Authorization'] = 'Bearer ' + accessToken;
+                response = await fetch(url, {
+                    ...options,
+                    headers: headers
+                });
+            } else {
+                throw new Error('Authentication failed after renewal');
+            }
+        }
+        
+        return response;
+    } catch (e) {
+        throw e;
+    }
+}
 
-// رفع الملف إلى درايف التاجر
-async function uploadToDrive(filename, content) {
-    if (!accessToken) {
-        showToast('⚠️ الرجاء تسجيل الدخول أولاً', 'error');
-        return;
+// ========== 11. دالة رفع الملف إلى Drive (المطورة) ==========
+async function uploadToDrive(filename, content, retryCount = 0) {
+    const MAX_RETRIES = 2;
+    
+    if (retryCount > MAX_RETRIES) {
+        const msg = 'فشل الرفع بعد عدة محاولات، يرجى تسجيل الدخول مجدداً';
+        if (typeof showToast === 'function') {
+            showToast(`❌ ${msg}`, 'error');
+        }
+        throw new Error(msg);
     }
     
     try {
-        // 1️⃣ البحث عن ملف بنفس الاسم في Drive
-        const searchResponse = await fetch(
-            `https://www.googleapis.com/drive/v3/files?q=name='${filename}' and trashed=false`,
-            {
-                headers: { 'Authorization': 'Bearer ' + accessToken }
-            }
+        const safeName = filename.replace(/'/g, "\\'");
+        const query = encodeURIComponent(`name='${safeName}' and mimeType='application/json' and trashed=false`);
+        
+        const searchResponse = await driveFetch(
+            `https://www.googleapis.com/drive/v3/files?q=${query}&fields=files(id)&pageSize=1`
         );
+        
+        if (!searchResponse.ok) {
+            const errorText = await searchResponse.text();
+            throw new Error(`Search failed: ${errorText}`);
+        }
+        
         const searchResult = await searchResponse.json();
         const existingFile = searchResult.files?.[0];
         
         if (existingFile) {
-            // 2️⃣ الملف موجود → نحدثه (يحل محل القديم)
-            const updateResponse = await fetch(
+            try {
+                localStorage.setItem(`file_id_${filename}`, existingFile.id);
+            } catch (e) {}
+            
+            const updateResponse = await driveFetch(
                 `https://www.googleapis.com/upload/drive/v3/files/${existingFile.id}?uploadType=media`,
                 {
                     method: 'PATCH',
-                    headers: {
-                        'Authorization': 'Bearer ' + accessToken,
-                        'Content-Type': 'application/json'
-                    },
+                    headers: { 'Content-Type': 'application/json' },
                     body: content
                 }
             );
             
             if (updateResponse.ok) {
-                showToast('✅ تم تحديث الملف بنجاح في درايفك', 'success');
+                if (typeof showToast === 'function') {
+                    showToast('✅ تم تحديث الملف بنجاح في درايفك', 'success');
+                }
+                return true;
             } else {
-                showToast('❌ فشل تحديث الملف', 'error');
+                const errorText = await updateResponse.text();
+                throw new Error(`Update failed: ${errorText}`);
             }
-            
         } else {
-            // 3️⃣ الملف غير موجود → ننشئ ملف جديد
-            const metadata = {
-                name: filename,
-                mimeType: 'application/json',
-                parents: ['root']
-            };
-            
+            const metadata = { name: filename, mimeType: 'application/json', parents: ['root'] };
             const form = new FormData();
             form.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
             form.append('file', new Blob([content], { type: 'application/json' }));
             
-            const response = await fetch(
+            const response = await driveFetch(
                 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart',
-                {
-                    method: 'POST',
-                    headers: { 'Authorization': 'Bearer ' + accessToken },
-                    body: form
-                }
+                { method: 'POST', body: form }
             );
+            
+            if (!response.ok) {
+                const errorText = await response.text();
+                throw new Error(`Upload failed: ${errorText}`);
+            }
             
             const data = await response.json();
             if (data.id) {
-                showToast(`✅ تم رفع الملف بنجاح في درايفك`, 'success');
+                try { localStorage.setItem(`file_id_${filename}`, data.id); } catch(e) {}
+                if (typeof showToast === 'function') {
+                    showToast('✅ تم رفع الملف بنجاح في درايفك', 'success');
+                }
+                return true;
             } else {
-                showToast("❌ فشل الرفع، حاول مرة أخرى", 'error');
+                throw new Error('Upload succeeded but no file ID returned');
             }
         }
-        
     } catch (e) {
-        console.error('خطأ:', e);
-        showToast('❌ خطأ: ' + e.message, 'error');
+        console.error('خطأ في الرفع:', e);
+        
+        if (e.message.includes('Authentication') || 
+            e.message.includes('401') || 
+            e.message.includes('403') ||
+            e.message.includes('timed out')) {
+            accessToken = null;
+            clearExpiry();
+            return uploadToDrive(filename, content, retryCount + 1);
+        }
+        
+        if (typeof showToast === 'function') {
+            showToast('❌ خطأ في الرفع: ' + e.message, 'error');
+        }
+        return false;
     }
 }
 
-// دالة الأرشفة (اللي التاجر يضغط عليها)
+// ========== 12. دالة رفع الملف بسرعة ==========
+async function uploadToDriveFast(filename, content) {
+    let fileId = null;
+    try {
+        fileId = localStorage.getItem(`file_id_${filename}`);
+    } catch (e) {}
+    
+    if (fileId) {
+        console.log(`⚡ استخدام ID محفوظ للملف: ${fileId}`);
+        
+        try {
+            const response = await driveFetch(
+                `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: content
+                }
+            );
+            
+            if (response.ok) {
+                if (typeof showToast === 'function') {
+                    showToast('✅ تم تحديث الملف بنجاح', 'success');
+                }
+                return true;
+            }
+            
+            if (response.status === 404) {
+                console.warn(`⚠️ الملف ${fileId} غير موجود، حذف المعرف المحفوظ`);
+                try { localStorage.removeItem(`file_id_${filename}`); } catch(e) {}
+            } else if (response.status === 401 || response.status === 403) {
+                throw new Error(`Authentication error: ${response.status}`);
+            } else {
+                const errorText = await response.text();
+                throw new Error(`Fast update failed: ${errorText}`);
+            }
+        } catch (e) {
+            console.warn('⚠️ فشل التحديث السريع، جاري البحث عن الملف...', e);
+        }
+    }
+    
+    return uploadToDrive(filename, content, 0);
+}
+
+// ========== 13. دالة أرشفة السنة (تستدعي uploadToDrive) ==========
 async function archiveYearToDrive() {
     const year = prompt("📅 أدخل السنة المراد أرشفتها:");
     if (!year) return;
     
-    const filename = `سنة_${year}.json`; // اسم ثابت لكل سنة
+    const filename = `سنة_${year}.json`;
     
     const allInvoices = await invoicesStore.getAll();
     const allPayments = await paymentsStore.getAll();
@@ -291,23 +608,58 @@ async function archiveYearToDrive() {
     
     try {
         const content = JSON.stringify(archiveData, null, 2);
-        await uploadToDrive(filename, content);
+        const success = await uploadToDrive(filename, content);
         
-        // حذف البيانات من التطبيق بعد الأرشفة
-        for (const inv of yearInvoices) await invoicesStore.delete(inv.id);
-        for (const p of yearPayments) await paymentsStore.delete(p.id);
-        
-        localStorage.setItem(`archived_${year}`, new Date().toISOString());
-        showToast(`✅ تم أرشفة سنة ${year} بنجاح`, "success");
-        if (typeof loadData === 'function') loadData();
+        if (success) {
+            for (const inv of yearInvoices) await invoicesStore.delete(inv.id);
+            for (const p of yearPayments) await paymentsStore.delete(p.id);
+            localStorage.setItem(`archived_${year}`, new Date().toISOString());
+            showToast(`✅ تم أرشفة سنة ${year} بنجاح`, "success");
+            if (typeof loadData === 'function') loadData();
+        }
     } catch(e) {
         showToast("❌ فشل الأرشفة: " + e.message, "error");
     }
 }
 
-// استعادة الصلاحية لو تخزنت
-const savedToken = localStorage.getItem('drive_access_token');
-if (savedToken) accessToken = savedToken;
+// ========== 14. التحقق من الجلسة عند تحميل الصفحة ==========
+(async function() {
+    let attempts = 0;
+    while (!isGoogleLoaded() && attempts < 10) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+        attempts++;
+    }
+    
+    if (!isGoogleLoaded()) {
+        console.warn('⚠️ لم يتم تحميل Google Identity Services');
+        return;
+    }
+    
+    initGoogleLogin();
+    
+    const expiry = loadExpiry();
+    const now = Date.now();
+    
+    if (expiry && now < expiry) {
+        console.log('✅ جلسة صالحة');
+        const success = await getTokenSilently();
+        if (success) {
+            startSystem();
+        }
+    } else {
+        console.log('⏳ لا توجد جلسة صالحة');
+        if (expiry) clearExpiry();
+    }
+})();
+
+// ========== 15. تعريف الدوال العامة ==========
+window.loginWithGoogle = loginWithGoogle;
+window.logoutFromGoogle = logoutFromGoogle;
+window.uploadToDrive = uploadToDrive;
+window.uploadToDriveFast = uploadToDriveFast;
+window.ensureValidToken = ensureValidToken;
+window.driveFetch = driveFetch;
+window.archiveYearToDrive = archiveYearToDrive;
 </script>
 
 <script>
